@@ -3,6 +3,9 @@ import { auth } from "@clerk/nextjs/server";
 import { HumanMessage } from "@langchain/core/messages";
 import { getAgentGraph } from "@/lib/langgraph/graph";
 import { mapRole } from "@/lib/auth/clerk";
+import { resolveOrgUuid, resolveUserAccess } from "@/lib/auth/rbac";
+
+export const maxDuration = 300; // Vercel max for Pro plan
 
 export async function POST(req: NextRequest) {
   try {
@@ -12,15 +15,26 @@ export async function POST(req: NextRequest) {
       return new NextResponse("Unauthorized", { status: 401 });
     }
 
+    const [orgUuid, access] = await Promise.all([
+      resolveOrgUuid(orgId),
+      resolveUserAccess(userId, orgId, mapRole(orgRole ?? undefined) ?? "member"),
+    ]);
+    if (!orgUuid) {
+      return new NextResponse("Organization not found", { status: 403 });
+    }
+
     const { message, threadId } = await req.json();
 
-    const role = mapRole(orgRole ?? undefined) ?? "member";
+    const role = access.role ?? mapRole(orgRole ?? undefined) ?? "member";
 
     const initialState = {
       messages: [new HumanMessage(message)],
-      org_id: orgId,
+      org_id: orgUuid,
       user_id: userId,
       user_role: role,
+      user_dept_id: access.dept_id ?? null,
+      accessible_dept_ids: access.accessible_dept_ids ?? [],
+      bi_grant_id: access.bi_grant_id ?? null,
     };
 
     const graph = await getAgentGraph();
@@ -33,7 +47,7 @@ export async function POST(req: NextRequest) {
         const eventStream = await graph.stream(initialState, {
           configurable: {
             thread_id: threadId || `user-${userId}`,
-            org_id: orgId,
+            org_id: orgUuid,
             user_id: userId,
           },
           streamMode: "values",
@@ -47,7 +61,7 @@ export async function POST(req: NextRequest) {
               final_answer: chunk.final_answer ?? null,
               cited_sources: chunk.cited_sources ?? [],
               awaiting_approval: chunk.awaiting_approval ?? false,
-              active_agent: chunk.next ?? null,
+              active_agent: chunk.active_agent ?? null,
             });
             await writer.write(encoder.encode(`data: ${data}\n\n`));
           }

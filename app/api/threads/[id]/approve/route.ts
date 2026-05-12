@@ -16,7 +16,7 @@
 
 import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
-import { resolveUserAccess } from "@/lib/auth/rbac";
+import { resolveUserAccess, resolveOrgUuid } from "@/lib/auth/rbac";
 import {
   processDecision,
   logHitlDecision,
@@ -37,9 +37,13 @@ export async function POST(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // 2. Resolve user access and verify org membership
-  const access = await resolveUserAccess(clerkUserId, clerkOrgId);
-  if (!access.role) {
+  // 2. Resolve org UUID + user access — org_id in graph state is a Supabase UUID,
+  //    not the Clerk org string. We must compare like-for-like.
+  const [orgUuid, access] = await Promise.all([
+    resolveOrgUuid(clerkOrgId),
+    resolveUserAccess(clerkUserId, clerkOrgId),
+  ]);
+  if (!orgUuid || !access.role) {
     return NextResponse.json(
       { error: "User not found in organization" },
       { status: 403 },
@@ -90,7 +94,8 @@ export async function POST(
   }
 
   const stateValues = currentState.values as Record<string, unknown>;
-  if (stateValues.orgId !== clerkOrgId || stateValues.userId !== clerkUserId) {
+  // Compare against Supabase UUID (state.org_id) not the Clerk org string
+  if (stateValues.org_id !== orgUuid || stateValues.user_id !== clerkUserId) {
     return NextResponse.json(
       { error: "Thread not found or you are not the owner" },
       { status: 403 },
@@ -153,30 +158,53 @@ export async function POST(
   );
 
   // 8. Resume the graph.
-  // The graph will now execute approval_node → synthesis_agent → END
-  // We don't await the full stream here — the client polls /api/agent/status
+  // The graph will now execute approval_node → synthesis_agent → END.
+  // Race the stream against a 25-second timeout:
+  //   • Completes within timeout → 200 { status: 'resumed' }
+  //   • Times out              → 202 { status: 'processing' } (graph still runs; client polls)
+  //   • Throws                 → 500 with the error
   const resumeConfig = { configurable: { thread_id: threadId } };
 
-  // Fire-and-forget: stream the rest of the graph.
-  // Client polls /api/agent/status for completion — we intentionally don't block here.
-  (async () => {
-    try {
-      const stream = await graph.stream(null, resumeConfig);
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      for await (const _chunk of stream) { /* drives execution */ }
-    } catch (err) {
-      console.error("[hitl] Graph resume failed after approval", {
-        threadId,
-        orgId: clerkOrgId,
-        userId: clerkUserId,
-        decision: body.action,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  })();
+  const TIMEOUT_MS = 25_000;
+
+  const runStream = async (): Promise<void> => {
+    const stream = await graph.stream(null, resumeConfig);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for await (const _chunk of stream) { /* drives execution */ }
+  };
+
+  const timeout = new Promise<'timeout'>((resolve) =>
+    setTimeout(() => resolve('timeout'), TIMEOUT_MS)
+  );
+
+  let raceResult: void | 'timeout';
+  try {
+    raceResult = await Promise.race([runStream(), timeout]);
+  } catch (err) {
+    console.error("[hitl] Graph resume failed after approval", {
+      threadId,
+      orgId: clerkOrgId,
+      userId: clerkUserId,
+      decision: body.action,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Graph resume failed" },
+      { status: 500 }
+    );
+  }
+
+  if (raceResult === 'timeout') {
+    // Graph is still running in the background — client should poll /api/agent/status
+    return NextResponse.json({
+      status: 'processing',
+      decision: body.action,
+      approved: result.approved,
+    }, { status: 202 });
+  }
 
   return NextResponse.json({
-    success: true,
+    status: 'resumed',
     decision: body.action,
     approved: result.approved,
   });

@@ -11,8 +11,9 @@
 // ============================================================
 
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
-import { getModel } from "../langgraph/llm-factory";
+import { resolveModelClient } from "../langgraph/llm-factory";
 import type { AtheneState, AtheneStateUpdate } from "../langgraph/state";
+import { supabaseAdmin } from "@/lib/supabase/server";
 
 // ---- Prompt (inlined at build time, no fs.readFileSync) ------
 
@@ -100,6 +101,33 @@ function parseEmailDraft(raw: string): {
   }
 }
 
+// ---- Provider detection ----------------------------------------
+
+// orgUuid is the Supabase org UUID (state.org_id) — already resolved, no Clerk lookup needed
+async function resolveEmailTool(orgUuid: string): Promise<"email-send" | "gmail-send"> {
+  const { data: msConn } = await supabaseAdmin
+    .from("nango_connections")
+    .select("id")
+    .eq("org_id", orgUuid)
+    .eq("provider_config_key", "microsoft")
+    .limit(1)
+    .maybeSingle();
+
+  if (msConn) return "email-send";
+
+  const { data: gmailConn } = await supabaseAdmin
+    .from("nango_connections")
+    .select("id")
+    .eq("org_id", orgUuid)
+    .in("provider_config_key", ["gmail", "google"])
+    .limit(1)
+    .maybeSingle();
+
+  if (gmailConn) return "gmail-send";
+
+  return "email-send";
+}
+
 // ---- Node function -------------------------------------------
 
 export async function emailAgentNode(
@@ -107,7 +135,7 @@ export async function emailAgentNode(
 ): Promise<AtheneStateUpdate> {
   const prompt = buildPrompt(state);
 
-  const llm = getModel();
+  const { client: llm } = await resolveModelClient(state.org_id, state.complexity ?? "simple");
 
   const response = await llm.invoke([
     { role: "system", content: prompt },
@@ -121,6 +149,9 @@ export async function emailAgentNode(
 
   const draft = parseEmailDraft(rawResponse);
 
+  // Determine which email provider the org has connected
+  const emailTool = await resolveEmailTool(state.org_id);
+
   // ATH-37: Set pending_write_action and pause for HITL approval.
   // The graph's interrupt_before: ["approval_node"] will halt
   // execution before the approval_node runs, giving the human
@@ -129,7 +160,7 @@ export async function emailAgentNode(
     run_status: "awaiting_approval",
     awaiting_approval: true,
     pending_write_action: {
-      tool: "email-send",
+      tool: emailTool,
       payload: draft,
       requested_at: new Date().toISOString(),
     },
